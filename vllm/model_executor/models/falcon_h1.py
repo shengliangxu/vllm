@@ -632,6 +632,20 @@ class FalconH1ForCausalLM(
             ("gate_up_proj", "up_proj", 1),
         ]
 
+        # Skip loading extra parameters for GPTQ/modelopt models.
+        ignore_suffixes = (
+            ".bias",
+            "_bias",
+            ".k_scale",
+            "_k_scale",
+            ".v_scale",
+            "_v_scale",
+            ".weight_scale",
+            "_weight_scale",
+            ".input_scale",
+            "_input_scale",
+        )
+
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
@@ -649,8 +663,10 @@ class FalconH1ForCausalLM(
                     continue
 
                 name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
+                # Skip loading extra bias for GPTQ/modelopt models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue
                 # Skip layers on other devices.
                 if is_pp_missing_parameter(name, self):
@@ -660,8 +676,10 @@ class FalconH1ForCausalLM(
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Skip loading extra bias for GPTQ models.
+                # Skip loading extra bias for GPTQ/modelopt models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue
                 if is_pp_missing_parameter(name, self):
                     continue
