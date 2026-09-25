@@ -1014,6 +1014,20 @@ class NemotronH_Nano_VL_V2(
                 nn.Linear(vision_projection_hidden_size, llm_hidden_size, bias=False),
             )
             self.mlp1 = mlp1.to(llm_dtype)
+
+            # Megatron places a final LayerNorm on the vision-tower output when
+            # the language model uses MTP (num_nextn_predict_layers > 0): the
+            # tower config inherits MTP, so the projector normalizes the RADIO
+            # features (per token, before pixel shuffle). Absent for non-MTP
+            # checkpoints. Mirrors the omni projector remote code.
+            if getattr(config.text_config, "num_nextn_predict_layers", 0) or 0:
+                self.vision_final_layernorm: nn.LayerNorm | None = nn.LayerNorm(
+                    vit_hidden_size,
+                    eps=getattr(vision_config, "layer_norm_eps", 1e-6),
+                ).to(llm_dtype)
+            else:
+                self.vision_final_layernorm = None
+
             self.sound_encoder: ProjectedParakeet | None = None
             if getattr(config, "sound_config", None) is not None:
                 logger.info_once(
@@ -1093,6 +1107,8 @@ class NemotronH_Nano_VL_V2(
         """Dynamic resolution extract_feature for images."""
         _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
         vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+        if self.vision_final_layernorm is not None:
+            vit_embeds = self.vision_final_layernorm(vit_embeds)
         vit_embeds = self.pixel_shuffle_dynamic_res(vit_embeds, imgs_sizes=imgs_sizes)
         vit_embeds = self.mlp1(vit_embeds)
         return vit_embeds
@@ -1125,6 +1141,8 @@ class NemotronH_Nano_VL_V2(
             else:
                 _, vit_embeds = self.vision_model(chunk)
             vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+            if self.vision_final_layernorm is not None:
+                vit_embeds = self.vision_final_layernorm(vit_embeds)
             vit_embeds = vit_embeds.reshape(
                 vit_embeds.shape[0], H_patches, W_patches, -1
             )
@@ -1591,12 +1609,38 @@ class NemotronH_Nano_VL_V2(
             for modality in ("image", "video", "audio")
         )
         adapter_dict = dict(self.mlp1.named_parameters())
+        if self.vision_final_layernorm is not None:
+            adapter_dict.update(
+                {
+                    f"vision_final_layernorm.{n}": p
+                    for n, p in self.vision_final_layernorm.named_parameters()
+                }
+            )
 
         def is_llm(name: str) -> bool:
             return name.startswith("language_model")
 
+        # Projector keys map onto self.mlp1 (nn.Sequential: 0=RMSNorm, 1/3=Linear)
+        # and the optional MTP vision_final_layernorm. Legacy checkpoints use
+        # top-level ``mlp1.{0,1,3}.*``; omni checkpoints nest them under
+        # ``vision_projector.mlp1.{norm,linear1,linear2}.*`` plus
+        # ``vision_projector.vision_final_layernorm.*``.
+        projector_submodule = {"norm": "0", "linear1": "1", "linear2": "3"}
+
         def is_adapter_weights(weight: tuple[str, torch.Tensor]):
-            return weight[0].startswith("mlp1")
+            name = weight[0]
+            return name.startswith("mlp1") or name.startswith("vision_projector.")
+
+        def adapter_target(name: str) -> str | None:
+            if name.startswith("mlp1."):
+                return name[len("mlp1.") :]
+            if name.startswith("vision_projector.vision_final_layernorm."):
+                return name[len("vision_projector.") :]
+            if name.startswith("vision_projector.mlp1."):
+                head, rest = name[len("vision_projector.mlp1.") :].split(".", 1)
+                idx = projector_submodule.get(head)
+                return f"{idx}.{rest}" if idx is not None else None
+            return None
 
         def is_vision_weights(name: str) -> bool:
             # The whole RADIO tower lives under ``vision_model.``: legacy
@@ -1626,8 +1670,10 @@ class NemotronH_Nano_VL_V2(
                 elif is_adapter_weights((name, w)):
                     if not load_multimodal_weights:
                         continue
-                    trimmed_name = ".".join(name.split(".")[1:])
-                    adapter_weights.append((trimmed_name, w.detach().clone()))
+                    target = adapter_target(name)
+                    if target is None or target not in adapter_dict:
+                        continue
+                    adapter_weights.append((target, w.detach().clone()))
                 elif is_vision_weights(name):
                     if not load_multimodal_weights:
                         continue
