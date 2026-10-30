@@ -205,6 +205,15 @@ def test_native_format_weight_loading(default_vllm_config, dist_init):
     config = RadioConfig(model_name="vit_small_patch16_224")
     model = RadioModel(config, num_hidden_layers_override=2)
 
+    # RadioModel allocates parameters uninitialized (vLLM style); fill them with
+    # deterministic values before snapshotting so the round-trip comparison does
+    # not read uninitialized memory, whose NaN bit patterns make torch.equal(x, x)
+    # return False and flake the test.
+    with torch.no_grad():
+        generator = torch.Generator().manual_seed(0)
+        for param in model.parameters():
+            param.normal_(generator=generator)
+
     # Every parameter (including layer_scale) must load from the native keys.
     expected = {
         name: param.detach().clone() for name, param in model.named_parameters()
@@ -260,11 +269,25 @@ def test_native_format_from_transformers(default_vllm_config, dist_init):
         for shard in sorted(Path(tmp).glob("*.safetensors")):
             native_weights.update(load_file(str(shard)))
 
+    # transformers renamed the native attention submodules across the supported
+    # range: <=5.1x emits ``attention.attention.{query,key,value}`` +
+    # ``attention.output.dense``; >=5.20 emits Dinov2-style
+    # ``attention.{q_proj,k_proj,v_proj}`` + ``attention.o_proj``. vLLM's mapper
+    # accepts both, so resolve whichever spelling this checkpoint used rather than
+    # pinning one transformers version.
+    dinov2_attn = any(".attention.q_proj." in name for name in native_weights)
+    qkv_sources = (
+        ("q_proj", "k_proj", "v_proj")
+        if dinov2_attn
+        else ("attention.query", "attention.key", "attention.value")
+    )
+    out_source = "o_proj" if dinov2_attn else "output.dense"
+
     # Guard that the saved checkpoint is genuinely native-layout (split attention
     # under ``encoder.layer.N``), not the legacy ``radio_model.model.blocks.*``.
-    assert any(".attention.attention.query" in name for name in native_weights), (
-        "expected native-layout keys in the save_original_format=False checkpoint"
-    )
+    assert dinov2_attn or any(
+        ".attention.attention.query" in name for name in native_weights
+    ), "expected native-layout keys in the save_original_format=False checkpoint"
     assert not any(name.startswith("radio_model.") for name in native_weights)
 
     hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
@@ -281,20 +304,20 @@ def test_native_format_from_transformers(default_vllm_config, dist_init):
     assert not missing, f"native weights not loaded: {sorted(missing)}"
 
     # Values match the reference: the fused qkv is the concatenation of the
-    # native split query/key/value, and proj is the native output.dense.
+    # native split q/k/v, and proj is the native output projection.
     for name, param in vllm_model.named_parameters():
         if ".attention.qkv." in name:
             base, suffix = name.split(".attention.qkv.")
             ref = torch.cat(
                 [
-                    native_weights[f"{base}.attention.attention.{proj}.{suffix}"]
-                    for proj in ("query", "key", "value")
+                    native_weights[f"{base}.attention.{source}.{suffix}"]
+                    for source in qkv_sources
                 ],
                 dim=0,
             )
         elif ".attention.proj." in name:
             base, suffix = name.split(".attention.proj.")
-            ref = native_weights[f"{base}.attention.output.dense.{suffix}"]
+            ref = native_weights[f"{base}.attention.{out_source}.{suffix}"]
         elif name in native_weights:
             ref = native_weights[name]
         else:
